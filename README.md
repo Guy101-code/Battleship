@@ -1,2 +1,1 @@
-# Battleship
-Battleships game Duos
+

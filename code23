@@ -1,0 +1,283 @@
+/*
+Battleships — Single-file React app (uses Tailwind classes)
+
+How to use:
+1) Create a Firebase project (Realtime Database, rules open for testing or set suitable rules).
+2) In the Firebase console get your SDK config and paste it into `FIREBASE_CONFIG` below.
+3) Build & deploy this React component to any static host (Vercel/Netlify) or create with create-react-app.
+
+Files: This is a single React component you can drop into App.jsx in a CRA or Next.js app.
+
+Notes:
+- This demo auto-places ships randomly for both players to keep things simple.
+- When you click "Start game" a room is created in Firebase and a shareable link is copied to clipboard.
+- The other player opens the link and joins the room.
+- Moves and results sync in realtime through Firebase Realtime Database.
+*/
+
+import React, { useEffect, useMemo, useState } from "react";
+import { initializeApp } from "firebase/app";
+import {
+  getDatabase,
+  ref,
+  push,
+  set,
+  onValue,
+  update,
+  get,
+  child,
+} from "firebase/database";
+
+// --- Paste your Firebase config here ---
+const firebaseConfig = {
+  apiKey: "AIzaSyC5C4mlRfpd2cM0gMqTcq_ERrVdYnTPA7I",
+  authDomain: "battleships-cc040.firebaseapp.com",
+  projectId: "battleships-cc040",
+  storageBucket: "battleships-cc040.firebasestorage.app",
+  messagingSenderId: "511743617639",
+  appId: "1:511743617639:web:f4408354809cadd69242c2"
+};
+
+// init Firebase
+const app = initializeApp(FIREBASE_CONFIG);
+const db = getDatabase(app);
+
+// helpers
+const makeEmptyBoard = () => Array(10).fill(null).map(() => Array(10).fill(0));
+
+const placeShipsRandomly = (board) => {
+  // simple ship set: 5,4,3,3,2
+  const ships = [5, 4, 3, 3, 2];
+  const b = board.map(r => r.slice());
+
+  const fits = (r, c, len, horiz) => {
+    if (horiz) {
+      if (c + len > 10) return false;
+      for (let i = 0; i < len; i++) if (b[r][c + i] === 1) return false;
+    } else {
+      if (r + len > 10) return false;
+      for (let i = 0; i < len; i++) if (b[r + i][c] === 1) return false;
+    }
+    return true;
+  };
+
+  for (const len of ships) {
+    let placed = false;
+    for (let tries = 0; tries < 500 && !placed; tries++) {
+      const horiz = Math.random() < 0.5;
+      const r = Math.floor(Math.random() * 10);
+      const c = Math.floor(Math.random() * 10);
+      if (!fits(r, c, len, horiz)) continue;
+      for (let i = 0; i < len; i++) {
+        if (horiz) b[r][c + i] = 1; else b[r + i][c] = 1;
+      }
+      placed = true;
+    }
+    if (!placed) {
+      // fallback: clear and restart
+      return placeShipsRandomly(makeEmptyBoard());
+    }
+  }
+  return b;
+};
+
+const uid = () => Math.random().toString(36).slice(2, 9);
+
+export default function App() {
+  const [playerId] = useState(uid);
+  const [roomId, setRoomId] = useState(null);
+  const [role, setRole] = useState(null); // 'host' or 'guest'
+  const [game, setGame] = useState(null);
+  const [status, setStatus] = useState('idle');
+
+  useEffect(() => {
+    // if URL has ?game=ROOMID join it as guest
+    const p = new URLSearchParams(window.location.search);
+    const q = p.get('game');
+    if (q) {
+      setRoomId(q);
+      setRole('guest');
+      setStatus('joining');
+      joinRoom(q);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const createRoom = async () => {
+    const roomRef = push(ref(db, 'games'));
+    const id = roomRef.key;
+    const hostBoard = placeShipsRandomly(makeEmptyBoard());
+    const guestBoard = placeShipsRandomly(makeEmptyBoard());
+
+    const initial = {
+      host: { id: playerId, ready: true },
+      guest: { id: null, ready: false },
+      boards: { host: hostBoard, guest: guestBoard },
+      moves: [],
+      turn: 'host',
+      createdAt: Date.now(),
+      state: 'waiting',
+    };
+    await set(roomRef, initial);
+    const url = window.location.origin + window.location.pathname + '?game=' + id;
+    await navigator.clipboard.writeText(url).catch(() => {});
+    setRoomId(id);
+    setRole('host');
+    setStatus('waiting');
+    watchRoom(id);
+    alert('Share this link with your friend (it was also copied to your clipboard):\n' + url);
+  };
+
+  const joinRoom = async (id) => {
+    const r = ref(db, `games/${id}`);
+    const snap = await get(r);
+    if (!snap.exists()) {
+      alert('Room not found');
+      setStatus('idle');
+      setRole(null);
+      setRoomId(null);
+      return;
+    }
+    const data = snap.val();
+    if (data.guest && data.guest.id) {
+      // room full
+      alert('This room already has a guest.');
+      setStatus('idle');
+      return;
+    }
+    await update(r, { 'guest/id': playerId, 'guest/ready': true, state: 'ready' });
+    setStatus('ready');
+    watchRoom(id);
+  };
+
+  const watchRoom = (id) => {
+    const r = ref(db, `games/${id}`);
+    onValue(r, (snap) => {
+      const v = snap.val();
+      setGame(v);
+      if (!v) {
+        setStatus('idle');
+        setRoomId(null);
+        setRole(null);
+      } else {
+        setRoomId(id);
+        if (!role) setRole(playerId === v.host?.id ? 'host' : 'guest');
+        if (v.state === 'finished') setStatus('finished');
+        else if (v.guest?.id && v.host?.id) setStatus('playing');
+      }
+    });
+  };
+
+  const makeMove = async (r, c) => {
+    if (!roomId || !game) return;
+    const myRole = role;
+    const turn = game.turn;
+    if (myRole !== turn) return;
+    // determine target board
+    const targetSide = myRole === 'host' ? 'guest' : 'host';
+    // check if already shot here
+    if (game.moves?.some(m => m.r === r && m.c === c)) return;
+
+    const cellVal = game.boards[targetSide][r][c];
+    const hit = cellVal === 1;
+
+    const move = { r, c, by: myRole, hit, at: Date.now() };
+    const nextTurn = (hit ? myRole : (myRole === 'host' ? 'guest' : 'host'));
+
+    const updates = {};
+    updates[`games/${roomId}/moves/${(game.moves||[]).length}`] = move;
+    updates[`games/${roomId}/turn`] = nextTurn;
+
+    // check win: if all ship cells on targetSide are hit after this move
+    const totalShipCells = game.boards[targetSide].flat().filter(x => x === 1).length;
+    const previousHits = (game.moves||[]).filter(m => m.hit && m.by !== myRole).length; // hits on target by whoever
+    const hitsNow = previousHits + (hit ? 1 : 0);
+    if (hitsNow >= totalShipCells) {
+      updates[`games/${roomId}/state`] = 'finished';
+      updates[`games/${roomId}/winner`] = myRole;
+    }
+
+    await update(ref(db), updates);
+  };
+
+  const resetRoom = async () => {
+    if (!roomId) return;
+    await set(ref(db, `games/${roomId}`), null);
+    setRoomId(null);
+    setRole(null);
+    setGame(null);
+    setStatus('idle');
+  };
+
+  const renderGrid = (who, isOpponent) => {
+    const board = game?.boards?.[who];
+    const moves = game?.moves || [];
+
+    return (
+      <div className="grid grid-cols-10 gap-0.5">
+        {board?.map((row, r) => row.map((cell, c) => {
+          const shot = moves.find(m => m.r === r && m.c === c);
+          const showShip = !isOpponent && cell === 1;
+          const className = `w-8 h-8 flex items-center justify-center border text-xs ${shot ? (shot.hit ? 'bg-red-400' : 'bg-slate-300') : 'bg-blue-50'} ${showShip ? 'bg-green-300' : ''}`;
+          return (
+            <div key={`${r}-${c}`} className={className}
+              onClick={() => { if (isOpponent && status === 'playing') makeMove(r,c); }}>
+              {shot ? (shot.hit ? 'X' : '•') : (showShip ? 'S' : '')}
+            </div>
+          );
+        }))}
+      </div>
+    );
+  };
+
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans">
+      <div className="max-w-4xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">Battleships — Play with a link</h1>
+          <div className="text-sm text-gray-600">You: <span className="font-mono">{playerId}</span></div>
+        </header>
+
+        <main className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          <section className="p-4 bg-white rounded-lg shadow">
+            <h2 className="font-semibold mb-2">Controls</h2>
+            <div className="space-y-2">
+              <button className="px-3 py-2 bg-indigo-600 text-white rounded" onClick={createRoom}>Start game (create link)</button>
+              <div className="flex items-center gap-2">
+                <input className="border p-1 rounded flex-1" placeholder="Paste room id or full link" value={roomId||''} onChange={(e)=>setRoomId(e.target.value)} />
+                <button className="px-2 py-1 border rounded" onClick={() => { if (roomId) joinRoom(roomId.replace(/.*[?&]game=/,'') ); }}>Join</button>
+              </div>
+              <div className="text-sm text-gray-700">Status: <strong>{status}</strong></div>
+              {roomId && <div className="text-xs mt-2">Share this link to invite: <br /><code className="break-all">{window.location.origin + window.location.pathname + '?game=' + roomId}</code></div>}
+              {game?.winner && <div className="text-green-700 font-semibold">Winner: {game.winner}</div>}
+              <div className="text-xs text-gray-500 mt-2">Note: this demo auto-places ships for both players.</div>
+            </div>
+          </section>
+
+          <section className="p-4 bg-white rounded-lg shadow">
+            <h2 className="font-semibold mb-2">Game</h2>
+            {!game && <div className="text-sm text-gray-600">No game joined yet.</div>}
+            {game && (
+              <div>
+                <div className="mb-3 text-sm">Room: <span className="font-mono">{roomId}</span> • Turn: <strong>{game.turn}</strong></div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <h3 className="text-sm mb-1">Your board</h3>
+                    {renderGrid(role==='host' ? 'host' : 'guest', false)}
+                  </div>
+                  <div>
+                    <h3 className="text-sm mb-1">Opponent</h3>
+                    {renderGrid(role==='host' ? 'guest' : 'host', true)}
+                  </div>
+                </div>
+                <div className="mt-3 text-xs text-gray-600">Click opponent grid to fire when it's your turn.</div>
+              </div>
+            )}
+          </section>
+        </main>
+
+        <footer className="mt-6 text-xs text-gray-500">This is a demo. For production make sure to secure your Firebase rules and add better UX, placement, reconnection logic, and ship-sinking detection.</footer>
+      </div>
+    </div>
+  );
+}

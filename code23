@@ -3,17 +3,19 @@ Battleships — Single-file React app (uses Tailwind classes)
 
 How to use:
 1) Create a Firebase project (Realtime Database, rules open for testing or set suitable rules).
-2) In the Firebase console get your SDK config and paste it into `FIREBASE_CONFIG` below.
+2) In the Firebase console, get your SDK config and paste it into `FIREBASE_CONFIG` below.
 3) Build & deploy this React component to any static host (Vercel/Netlify) or create with create-react-app.
 
 Files: This is a single React component you can drop into App.jsx in a CRA or Next.js app.
 
 Notes:
 - This demo auto-places ships randomly for both players to keep things simple.
-- When you click "Start game" a room is created in Firebase and a shareable link is copied to clipboard.
+- When you click "Start game," a room is created in Firebase, and a shareable link is copied to the lipboard.
 - The other player opens the link and joins the room.
-- Moves and results sync in realtime through Firebase Realtime Database.
+- Moves and results sync in real-time through Firebase Realtime Database.
 */
+
+import './App.css';
 
 import React, { useEffect, useMemo, useState } from "react";
 import { initializeApp } from "firebase/app";
